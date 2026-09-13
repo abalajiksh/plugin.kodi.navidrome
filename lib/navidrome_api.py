@@ -1,13 +1,17 @@
-import json
-import time
-import urllib.request
-import urllib.parse
-import urllib.error
 import hashlib
+import json
 import random
+import ssl
 import string
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
 import xbmc
 import xbmcaddon
+
+from lib import vfs
 
 
 # OpenSubsonic extension names
@@ -15,6 +19,44 @@ EXT_SONIC_SIMILARITY = 'sonicSimilarity'   # Navidrome v0.62.0 (plugin-needed)
 EXT_PLAYBACK_REPORT = 'playbackReport'     # Navidrome v0.62.0
 EXT_SONG_LYRICS = 'songLyrics'
 EXT_TRANSCODE_OFFSET = 'transcodeOffset'
+
+# Both Navidrome's native REST layer and the Subsonic endpoints refuse to
+# return more than this many rows in a single response, whatever we ask for.
+# Larger pages are assembled client side from several requests.
+MAX_REQUEST_SIZE = 500
+
+# How long a cached login (JWT + server issued Subsonic salt/token) is reused
+# before we log in again. The JWT rolls on every request, so this only has to
+# be shorter than Navidrome's session lifetime.
+SESSION_TTL = 6 * 60 * 60
+
+# Bitrates/formats offered by the settings, used to sanitise stored values.
+VALID_BITRATES = [64, 96, 128, 160, 192, 256, 320]
+VALID_FORMATS = ['mp3', 'opus', 'aac']
+
+
+def _setting_choice(addon, setting_id, choices, default):
+    """
+    Read an enum-ish setting tolerantly.
+
+    Old versions of this addon declared these as ``type="enum"``, which stores
+    the *index* of the chosen value, while the settings file advertised the
+    value itself as the default. Accept either shape so upgrading users don't
+    end up transcoding at "4 kbps".
+    """
+    raw = (addon.getSetting(setting_id) or '').strip()
+    if not raw:
+        return default
+    for choice in choices:
+        if raw == str(choice):
+            return choice
+    try:
+        index = int(raw)
+    except ValueError:
+        return default
+    if 0 <= index < len(choices):
+        return choices[index]
+    return default
 
 
 class NavidromeAPI:
@@ -29,12 +71,16 @@ class NavidromeAPI:
         # Get settings of addon
         addon = xbmcaddon.Addon()
         self.enable_transcoding = addon.getSettingBool('enable_transcoding')
-        self.max_bitrate = int(addon.getSetting('max_bitrate') or '192')
-
-        self.transcode_format = addon.getSetting('transcode_format') or 'mp3'
+        self.max_bitrate = _setting_choice(addon, 'max_bitrate', VALID_BITRATES, 192)
+        self.transcode_format = _setting_choice(addon, 'transcode_format', VALID_FORMATS, 'mp3')
 
         self.api_timeout = int(addon.getSetting('api_timeout') or '10')
         self.enable_debug = addon.getSettingBool('enable_debug')
+
+        # TLS — self-signed / private CA support
+        self.verify_ssl = self._get_bool(addon, 'verify_ssl', True)
+        self.ca_cert_path = (addon.getSetting('ca_cert_path') or '').strip()
+        self.ssl_context = self._build_ssl_context()
 
         # Native API (JWT) auth parameters
         self.native_token = None          # x-nd-authorization bearer token
@@ -50,9 +96,108 @@ class NavidromeAPI:
         self.open_subsonic = False
         self.os_extensions = set()
 
-        # Authenticate native first; capability-detect the Subsonic layer
-        self._authenticate_native()
-        self._detect_opensubsonic()
+        # Reuse the previous login when we still have a fresh one on disk;
+        # a plugin process is spawned for every directory listing and a
+        # round trip to /auth/login on each of them is pure latency.
+        if not self._load_cached_session():
+            self._authenticate_native()
+            self._detect_opensubsonic()
+            self._save_session()
+
+    @staticmethod
+    def _get_bool(addon, setting_id, default):
+        """getSettingBool but tolerant of the setting not existing yet."""
+        try:
+            return addon.getSettingBool(setting_id)
+        except Exception:
+            raw = (addon.getSetting(setting_id) or '').strip().lower()
+            if raw in ('true', 'false'):
+                return raw == 'true'
+            return default
+
+    # TLS
+    def _build_ssl_context(self):
+        """
+        Build the SSL context used for every urllib call.
+
+        With verification disabled the addon talks to servers using a
+        self-signed certificate; pointing at a CA bundle instead keeps
+        verification on for a private CA, which is the better option.
+        """
+        if not self.verify_ssl:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            xbmc.log(
+                "NAVIDROME API: TLS certificate verification disabled by settings",
+                xbmc.LOGWARNING
+            )
+            return context
+
+        if self.ca_cert_path:
+            try:
+                return ssl.create_default_context(cafile=vfs.translate(self.ca_cert_path))
+            except Exception as exc:
+                xbmc.log(
+                    f"NAVIDROME API: Could not load CA bundle "
+                    f"'{self.ca_cert_path}': {exc}. Using system trust store.",
+                    xbmc.LOGERROR
+                )
+        return ssl.create_default_context()
+
+    def _urlopen(self, req):
+        """urlopen with the addon's SSL context and timeout applied."""
+        return urllib.request.urlopen(req, timeout=self.api_timeout, context=self.ssl_context)
+
+    def kodi_url(self, url):
+        """
+        Decorate a URL that Kodi itself will fetch (streams, artwork).
+
+        Kodi uses its own cURL stack for these, so the Python SSL context does
+        not apply — the trust decision has to travel with the URL as a Kodi
+        protocol option instead.
+        """
+        if not self.verify_ssl and url.lower().startswith('https://'):
+            return url + '|verifypeer=false'
+        return url
+
+    # Session cache
+    def _session_key(self):
+        """Identity of the current credentials; a change invalidates the cache."""
+        digest = hashlib.sha256(
+            f"{self.server_url}\x00{self.username}\x00{self.password}".encode('utf-8')
+        ).hexdigest()
+        return digest
+
+    def _load_cached_session(self):
+        data = vfs.load_session(self._session_key(), SESSION_TTL)
+        if not data or not data.get('native_token'):
+            return False
+
+        self.native_token = data.get('native_token')
+        self.subsonic_salt = data.get('subsonic_salt')
+        self.subsonic_token = data.get('subsonic_token')
+        self.user_id = data.get('user_id')
+        self.is_admin = bool(data.get('is_admin'))
+        self.open_subsonic = bool(data.get('open_subsonic'))
+        self.os_extensions = set(data.get('extensions') or [])
+
+        if self.enable_debug:
+            xbmc.log("NAVIDROME API: Reusing cached session", xbmc.LOGINFO)
+        return True
+
+    def _save_session(self):
+        if not self.native_token:
+            return
+        vfs.save_session(self._session_key(), {
+            'native_token': self.native_token,
+            'subsonic_salt': self.subsonic_salt,
+            'subsonic_token': self.subsonic_token,
+            'user_id': self.user_id,
+            'is_admin': self.is_admin,
+            'open_subsonic': self.open_subsonic,
+            'extensions': sorted(self.os_extensions),
+        })
 
     # Native api
     def _authenticate_native(self):
@@ -74,7 +219,7 @@ class NavidromeAPI:
                 method='POST'
             )
 
-            with urllib.request.urlopen(req, timeout=self.api_timeout) as response:
+            with self._urlopen(req) as response:
                 result = json.loads(response.read().decode('utf-8'))
                 self.native_token = result.get('token')
                 # Navidrome returns server-issued Subsonic auth so we don't
@@ -92,11 +237,31 @@ class NavidromeAPI:
                         xbmc.LOGINFO
                     )
                 return self.native_token is not None
+        except ssl.SSLError as exc:
+            self._log_ssl_error(exc)
+            self.native_token = None
+            return False
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLError):
+                self._log_ssl_error(exc.reason)
+            elif self.enable_debug:
+                xbmc.log(f"NAVIDROME API: Native auth failed: {exc.reason}", xbmc.LOGWARNING)
+            self.native_token = None
+            return False
         except Exception as e:
             if self.enable_debug:
                 xbmc.log(f"NAVIDROME API: Native auth failed: {str(e)}", xbmc.LOGWARNING)
             self.native_token = None
             return False
+
+    def _log_ssl_error(self, exc):
+        xbmc.log(
+            f"NAVIDROME API: TLS error talking to {self.server_url}: {exc}. "
+            "If the server uses a self-signed certificate, either point "
+            "'CA certificate' at its CA in the addon settings or turn off "
+            "'Verify TLS certificate'.",
+            xbmc.LOGERROR
+        )
 
     def _make_native_request(self, endpoint, params=None, _retry=True):
         """
@@ -118,7 +283,7 @@ class NavidromeAPI:
             req.add_header('Accept', 'application/json')
             req.add_header('User-Agent', self.user_agent)
 
-            with urllib.request.urlopen(req, timeout=self.api_timeout) as response:
+            with self._urlopen(req) as response:
                 # Refresh rolling token if the server issued a new one
                 new_token = response.headers.get('x-nd-authorization')
                 if new_token and new_token.startswith('Bearer '):
@@ -135,12 +300,20 @@ class NavidromeAPI:
             if e.code == 401 and _retry:
                 if self.enable_debug:
                     xbmc.log("NAVIDROME NATIVE API: 401, re-authenticating", xbmc.LOGINFO)
+                vfs.clear_session()
                 if self._authenticate_native():
+                    self._save_session()
                     return self._make_native_request(endpoint, params, _retry=False)
             xbmc.log(
                 f"NAVIDROME NATIVE API ERROR: {e.code} - {e.reason} for {endpoint}",
                 xbmc.LOGERROR
             )
+            return None
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, ssl.SSLError):
+                self._log_ssl_error(e.reason)
+            else:
+                xbmc.log(f"NAVIDROME NATIVE API ERROR: {e.reason}", xbmc.LOGERROR)
             return None
         except Exception as e:
             xbmc.log(f"NAVIDROME NATIVE API ERROR: {str(e)}", xbmc.LOGERROR)
@@ -180,13 +353,13 @@ class NavidromeAPI:
         try:
             url = self._build_url(endpoint, params)
             if self.enable_debug:
-                xbmc.log(f"NAVIDROME API: Requesting {endpoint}", xbmc.LOGINFO)
+                xbmc.log(f"NAVIDROME API: Requesting {endpoint} {params or ''}", xbmc.LOGINFO)
 
             req = urllib.request.Request(url)
             req.add_header('User-Agent', self.user_agent)
             req.add_header('Accept', 'application/json')
 
-            with urllib.request.urlopen(req, timeout=self.api_timeout) as response:
+            with self._urlopen(req) as response:
                 data = json.loads(response.read().decode('utf-8'))
 
                 if 'subsonic-response' in data:
@@ -211,7 +384,13 @@ class NavidromeAPI:
             )
             return None
         except urllib.error.URLError as e:
-            xbmc.log(f"NAVIDROME URL ERROR: {e.reason}", xbmc.LOGERROR)
+            if isinstance(e.reason, ssl.SSLError):
+                self._log_ssl_error(e.reason)
+            else:
+                xbmc.log(f"NAVIDROME URL ERROR: {e.reason}", xbmc.LOGERROR)
+            return None
+        except ssl.SSLError as e:
+            self._log_ssl_error(e)
             return None
         except Exception as e:
             xbmc.log(f"NAVIDROME ERROR: {str(e)}", xbmc.LOGERROR)
@@ -239,6 +418,73 @@ class NavidromeAPI:
         """Return True if the server advertises a given OpenSubsonic extension."""
         return name in self.os_extensions
 
+    # Pagination
+    def _paged(self, fetch, size, offset):
+        """
+        Assemble a page of ``size`` items starting at ``offset``.
+
+        Neither API layer honours a page larger than MAX_REQUEST_SIZE — asking
+        for 1000 rows silently yields 500 — so the page is built from as many
+        requests as it takes. ``fetch(count, start)`` must return a list, or
+        None to signal the request itself failed.
+
+        Returns (items, first_request_failed).
+        """
+        items = []
+        seen = set()
+        total = 0
+        remaining = max(0, int(size))
+        cursor = max(0, int(offset))
+        first_failed = False
+
+        while remaining > 0:
+            want = min(remaining, MAX_REQUEST_SIZE)
+            batch = fetch(want, cursor)
+
+            if batch is None:
+                first_failed = not items
+                break
+            if not batch:
+                break
+
+            total = max(total, self.last_total_count)
+
+            fresh = []
+            for entry in batch:
+                key = entry.get('id') if isinstance(entry, dict) else None
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                fresh.append(entry)
+
+            if not fresh:
+                # The server handed back rows we already have, meaning it
+                # ignored our offset. Stop rather than loop forever.
+                xbmc.log(
+                    "NAVIDROME API: server ignored pagination offset "
+                    f"{cursor}; stopping at {len(items)} items",
+                    xbmc.LOGWARNING
+                )
+                break
+
+            items.extend(fresh)
+            cursor += len(batch)
+            remaining -= len(batch)
+
+            if len(batch) < want:
+                # Short page — the result set is exhausted.
+                break
+
+        self.last_total_count = total
+        if self.enable_debug:
+            xbmc.log(
+                f"NAVIDROME API: page offset={offset} requested={size} "
+                f"returned={len(items)} total={total}",
+                xbmc.LOGINFO
+            )
+        return items, first_failed
+
     # System
     def ping(self):
         """Test connection to server."""
@@ -246,20 +492,28 @@ class NavidromeAPI:
         return response is not None
 
     # native-first with Subsonic fallback
-    def get_artists(self):
-        """Get all artists (native first, Subsonic fallback)."""
-        data = self._make_native_request('artist', {
-            '_start': 0, '_end': 0, '_sort': 'name', '_order': 'ASC'
-        })
-        if isinstance(data, list):
-            return data
+    def get_artists(self, size=500, offset=0):
+        """Get artists (native first with pagination, Subsonic fallback)."""
+        def fetch_native(count, start):
+            data = self._make_native_request('artist', {
+                '_start': start, '_end': start + count,
+                '_sort': 'name', '_order': 'ASC'
+            })
+            return data if isinstance(data, list) else None
 
+        artists, failed = self._paged(fetch_native, size, offset)
+        if artists or not failed:
+            return artists
+
+        # Subsonic getArtists has no pagination — slice locally.
         response = self._make_request('getArtists')
         if response and 'artists' in response:
             all_artists = []
             for index in response['artists'].get('index', []):
                 all_artists.extend(index.get('artist', []))
-            return all_artists
+            self.last_total_count = len(all_artists)
+            return all_artists[offset:offset + size]
+        self.last_total_count = 0
         return []
 
     def get_artist(self, artist_id):
@@ -274,6 +528,13 @@ class NavidromeAPI:
         response = self._make_request('getAlbum', {'id': album_id})
         if response and 'album' in response:
             return response['album']
+        return None
+
+    def get_song(self, song_id):
+        """Get a single track's metadata."""
+        response = self._make_request('getSong', {'id': song_id})
+        if response and 'song' in response:
+            return response['song']
         return None
 
     def get_album_list(self, list_type='alphabeticalByName', size=500, offset=0):
@@ -294,59 +555,86 @@ class NavidromeAPI:
 
         if list_type in native_sort:
             sort, order = native_sort[list_type]
-            data = self._make_native_request('album', {
-                '_start': offset,
-                '_end': offset + size,
-                '_sort': sort,
-                '_order': order
-            })
-            if isinstance(data, list):
-                return data
+
+            def fetch_native(count, start):
+                data = self._make_native_request('album', {
+                    '_start': start,
+                    '_end': start + count,
+                    '_sort': sort,
+                    '_order': order
+                })
+                return data if isinstance(data, list) else None
+
+            albums, failed = self._paged(fetch_native, size, offset)
+            if albums or not failed:
+                return albums
 
         # Subsonic fallback (also handles 'random')
-        response = self._make_request('getAlbumList2', {
-            'type': list_type,
-            'size': size,
-            'offset': offset
-        })
-        if response and 'albumList2' in response:
-            return response['albumList2'].get('album', [])
-        return []
+        def fetch_subsonic(count, start):
+            response = self._make_request('getAlbumList2', {
+                'type': list_type,
+                'size': count,
+                'offset': start
+            })
+            if response and 'albumList2' in response:
+                return response['albumList2'].get('album', [])
+            return None
+
+        albums, _failed = self._paged(fetch_subsonic, size, offset)
+        return albums
 
     def get_all_songs(self, size=500, offset=0):
-        """Get all songs — native /api/song first, Subsonic genre-hack fallback."""
-        data = self._make_native_request('song', {
-            '_start': offset,
-            '_end': offset + size,
-            '_sort': 'title',
-            '_order': 'ASC'
-        })
-        if isinstance(data, list):
-            return data
+        """Get all songs — native /api/song first, Subsonic search fallback."""
+        def fetch_native(count, start):
+            data = self._make_native_request('song', {
+                '_start': start,
+                '_end': start + count,
+                '_sort': 'title',
+                '_order': 'ASC'
+            })
+            return data if isinstance(data, list) else None
 
-        # Fallback: empty-genre trick returns all songs on Subsonic
-        response = self._make_request('getSongsByGenre', {
-            'genre': '',
-            'count': size,
-            'offset': offset
-        })
-        if response and 'songsByGenre' in response:
-            return response['songsByGenre'].get('song', [])
-        return []
+        songs, failed = self._paged(fetch_native, size, offset)
+        if songs or not failed:
+            return songs
 
-    def get_starred_albums(self):
+        # Fallback: an empty search3 query matches the whole library and,
+        # unlike getSongsByGenre, paginates properly.
+        def fetch_subsonic(count, start):
+            response = self._make_request('search3', {
+                'query': '',
+                'artistCount': 0,
+                'albumCount': 0,
+                'songCount': count,
+                'songOffset': start
+            })
+            if response and 'searchResult3' in response:
+                return response['searchResult3'].get('song', [])
+            return None
+
+        songs, _failed = self._paged(fetch_subsonic, size, offset)
+        return songs
+
+    def get_starred_albums(self, size=500, offset=0):
         """Get starred/favourite albums (native filter first, Subsonic fallback)."""
-        data = self._make_native_request('album', {
-            '_start': 0, '_end': 0,
-            '_sort': 'starredAt', '_order': 'DESC',
-            'starred': 'true'
-        })
-        if isinstance(data, list):
-            return data
+        def fetch_native(count, start):
+            data = self._make_native_request('album', {
+                '_start': start, '_end': start + count,
+                '_sort': 'starredAt', '_order': 'DESC',
+                'starred': 'true'
+            })
+            return data if isinstance(data, list) else None
+
+        albums, failed = self._paged(fetch_native, size, offset)
+        if albums or not failed:
+            return albums
 
         response = self._make_request('getStarred2')
         if response and 'starred2' in response:
-            return response['starred2'].get('album', [])
+            all_albums = response['starred2'].get('album', [])
+            self.last_total_count = len(all_albums)
+            return all_albums[offset:offset + size]
+        self.last_total_count = 0
         return []
 
     # Playlists
@@ -385,8 +673,8 @@ class NavidromeAPI:
         response = self._make_request('search3', {
             'query': query,
             'artistCount': artist_count,
-            'albumCount': album_count,
-            'songCount': song_count
+            'albumCount': min(album_count, MAX_REQUEST_SIZE),
+            'songCount': min(song_count, MAX_REQUEST_SIZE)
         })
         if response and 'searchResult3' in response:
             return response['searchResult3']
@@ -402,26 +690,34 @@ class NavidromeAPI:
 
     def get_songs_by_genre(self, genre, size=500, offset=0):
         """Get songs by genre."""
-        response = self._make_request('getSongsByGenre', {
-            'genre': genre,
-            'count': size,
-            'offset': offset
-        })
-        if response and 'songsByGenre' in response:
-            return response['songsByGenre'].get('song', [])
-        return []
+        def fetch(count, start):
+            response = self._make_request('getSongsByGenre', {
+                'genre': genre,
+                'count': count,
+                'offset': start
+            })
+            if response and 'songsByGenre' in response:
+                return response['songsByGenre'].get('song', [])
+            return None
+
+        songs, _failed = self._paged(fetch, size, offset)
+        return songs
 
     def get_albums_by_genre(self, genre, size=500, offset=0):
         """Get albums by genre."""
-        response = self._make_request('getAlbumList2', {
-            'type': 'byGenre',
-            'genre': genre,
-            'size': size,
-            'offset': offset
-        })
-        if response and 'albumList2' in response:
-            return response['albumList2'].get('album', [])
-        return []
+        def fetch(count, start):
+            response = self._make_request('getAlbumList2', {
+                'type': 'byGenre',
+                'genre': genre,
+                'size': count,
+                'offset': start
+            })
+            if response and 'albumList2' in response:
+                return response['albumList2'].get('album', [])
+            return None
+
+        albums, _failed = self._paged(fetch, size, offset)
+        return albums
 
     # Similarity — Instant Mix (v0.60) + sonicSimilarity (v0.62, plugin needed)
     def get_similar_songs(self, song_id, count=50):
@@ -504,18 +800,44 @@ class NavidromeAPI:
 
     # Media
     def get_cover_art_url(self, cover_art_id, size=300):
-        """Get cover art URL."""
-        return self._build_url('getCoverArt', {'id': cover_art_id, 'size': size})
+        """Get cover art URL (fetched by Kodi)."""
+        return self.kodi_url(self._build_url('getCoverArt', {'id': cover_art_id, 'size': size}))
 
-    def get_stream_url(self, song_id, max_bit_rate=None):
-        """Get stream URL for a song."""
+    def get_stream_url(self, song_id, max_bit_rate=None, for_kodi=True):
+        """
+        Get stream URL for a song.
+
+        ``for_kodi`` decorates the URL with Kodi protocol options; pass False
+        when the addon itself will fetch the URL with urllib.
+        """
         params = {'id': song_id}
         if self.enable_transcoding:
             params['maxBitRate'] = self.max_bitrate
             params['format'] = self.transcode_format
         elif max_bit_rate:
             params['maxBitRate'] = max_bit_rate
-        return self._build_url('stream', params)
+        url = self._build_url('stream', params)
+        return self.kodi_url(url) if for_kodi else url
+
+    def open_stream(self, song_id):
+        """
+        Open the raw audio stream for downloading, honouring the TLS settings.
+        Returns the response object (caller must close it) or None.
+        """
+        try:
+            url = self.get_stream_url(song_id, for_kodi=False)
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', self.user_agent)
+            return self._urlopen(req)
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLError):
+                self._log_ssl_error(exc.reason)
+            else:
+                xbmc.log(f"NAVIDROME API: stream open failed: {exc.reason}", xbmc.LOGERROR)
+            return None
+        except Exception as exc:
+            xbmc.log(f"NAVIDROME API: stream open failed: {exc}", xbmc.LOGERROR)
+            return None
 
     # Playback reporting / annotation — Subsonic/OpenSubsonic
     def report_playback(self, track_id, submission=True):
@@ -575,9 +897,34 @@ class NavidromeAPI:
         return response is not None
 
     def set_rating(self, item_id, rating):
-        """Set rating for a song (1-5 stars)."""
+        """
+        Set the rating of a song, album or artist (0-5; 0 removes it).
+
+        Subsonic takes the item id directly whatever its type, so the same
+        call covers all three.
+        """
+        try:
+            rating = max(0, min(5, int(rating)))
+        except (TypeError, ValueError):
+            return False
         response = self._make_request('setRating', {
             'id': item_id,
             'rating': rating
         })
         return response is not None
+
+    @staticmethod
+    def get_item_rating(item):
+        """
+        Read the current 0-5 rating off an item from either API shape:
+        Subsonic exposes 'userRating', the native API 'rating'.
+        """
+        for key in ('userRating', 'rating'):
+            value = item.get(key)
+            if value in (None, ''):
+                continue
+            try:
+                return max(0, min(5, int(value)))
+            except (TypeError, ValueError):
+                continue
+        return 0

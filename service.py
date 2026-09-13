@@ -1,7 +1,10 @@
+import time
+import urllib.parse
+
 import xbmc
 import xbmcaddon
-import time
 
+from lib import vfs
 from lib.navidrome_api import NavidromeAPI
 
 
@@ -15,6 +18,9 @@ class NavidromeMonitor(xbmc.Monitor):
     def onSettingsChanged(self):
         """Called when addon settings are changed"""
         xbmc.log("NAVIDROME SERVICE: Settings changed, reinitializing API", xbmc.LOGINFO)
+        # Server, credentials or TLS options may all have moved; drop the
+        # cached login so the next request authenticates afresh.
+        vfs.clear_session()
         self.service.init_api()
 
 
@@ -103,26 +109,39 @@ class NavidromePlayer(xbmc.Player):
         self.play_start_time = None
     
     def _get_navidrome_track_id(self):
-        """Extract Navidrome track ID from the playing URL"""
+        """
+        Work out which Navidrome track is playing.
+
+        Normally the resolved path is the /rest/stream URL and the id is right
+        there in the query string. When the track came out of the offline cache
+        the path is a local special:// file instead, so fall back to the marker
+        the plugin writes through xbmcvfs as it resolves playback.
+        """
         try:
             playing_file = self.getPlayingFile()
-            
-            # Check if it's a Navidrome URL
-            if 'rest/stream' not in playing_file and '/api/stream' not in playing_file:
-                return None
-            
-            # Extract ID from URL parameter
-            import urllib.parse
-            parsed = urllib.parse.urlparse(playing_file)
-            params = urllib.parse.parse_qs(parsed.query)
-            
-            if 'id' in params:
-                return params['id'][0]
-            
-            return None
         except Exception as e:
-            xbmc.log(f"NAVIDROME SERVICE: Error getting track ID: {str(e)}", xbmc.LOGERROR)
+            xbmc.log(f"NAVIDROME SERVICE: Error getting playing file: {str(e)}", xbmc.LOGERROR)
             return None
+
+        if not playing_file:
+            return None
+
+        try:
+            if 'rest/stream' in playing_file or '/api/stream' in playing_file:
+                # Strip any Kodi protocol options (|verifypeer=false, ...)
+                # before parsing, they are not part of the query string.
+                url = playing_file.split('|', 1)[0]
+                params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+                if 'id' in params:
+                    return params['id'][0]
+        except Exception as e:
+            xbmc.log(f"NAVIDROME SERVICE: Error parsing stream URL: {str(e)}", xbmc.LOGERROR)
+
+        marker = vfs.get_now_playing(max_age=3600)
+        if marker and marker.get('id') and marker.get('path') == playing_file:
+            return marker['id']
+
+        return None
     
     def check_scrobble_progress(self):
         """Check if we should scrobble based on playback progress"""
