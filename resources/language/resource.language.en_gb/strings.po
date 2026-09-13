@@ -53,3 +53,39 @@ msgstr ""
 msgctxt "#32013"
 msgid "Enable Debug Logging"
 msgstr ""
+
+msgctxt "#32014"
+msgid "Verify TLS certificate"
+msgstr ""
+
+msgctxt "#32015"
+msgid "CA certificate (for a private/self-signed CA)"
+msgstr ""
+
+msgctxt "#32016"
+msgid "Enable Offline Cache"
+msgstr ""
+
+msgctxt "#32017"
+msgid "Offline Cache Size (MB)"
+msgstr ""
+
+msgctxt "#32018"
+msgid "Clear Offline Cache"
+msgstr ""
+
+msgctxt "#32019"
+msgid "Set Rating"
+msgstr ""
+
+msgctxt "#32020"
+msgid "Download for offline"
+msgstr ""
+
+msgctxt "#32021"
+msgid "Remove download"
+msgstr ""
+
+msgctxt "#32022"
+msgid "Offline"
+msgstr ""

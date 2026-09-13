@@ -15,9 +15,17 @@
 *   **Search**: Search for Artists, Albums, and Songs.
 *   **Library Management**:
     *   **Star/Unstar**: Mark albums and songs as favourites directly from Kodi.
+    *   **Ratings**: Set a 0-5 star rating on any song, album or artist from the
+        context menu; existing ratings are shown in Kodi's own rating column.
     *   **Playlists**: Create new playlists or add tracks to existing ones.
+*   **Offline Playback (VFS)**: Download tracks, albums or whole playlists into a
+    local cache built on Kodi's Virtual File System (`xbmcvfs`), browse them under
+    **Offline**, and play them with the server unreachable. Playback transparently
+    prefers a cached copy over the network stream.
 *   **Scrobbling**: Fully functional scrobbling and "Now Playing" status updates to your Navidrome server.
 *   **Transcoding**: Supports server-side transcoding with configurable bitrates and formats (MP3, etc.) for bandwidth management.
+*   **HTTPS**: Works with public certificates, a private CA, or a self-signed
+    certificate.
 
 ## Installation
 
@@ -37,15 +45,38 @@ After installation, you must configure the addon to connect to your Navidrome se
     *   **Server URL**: The full URL to your Navidrome instance (e.g., `https://music.mydomain.com` or `http://192.168.1.10:4533`).
     *   **Username**: Your Navidrome username.
     *   **Password**: Your Navidrome password.
-4.  (Optional) Configure **Transcoding**:
+4.  (Optional) Configure **TLS**, under the same **Server** tab:
+    *   **Verify TLS certificate** (default: on). Leave this on whenever you can.
+    *   **CA certificate**: point this at the CA (or the certificate itself) that
+        signed your server's certificate. This is the right way to use a private
+        CA or a self-signed certificate — verification stays on.
+    *   Turning **Verify TLS certificate** off disables certificate checking for
+        both the addon's own API calls and Kodi's streaming/artwork requests. It
+        makes a self-signed server work with no further setup, at the cost of no
+        protection against an intercepted connection — prefer the CA option.
+5.  (Optional) Configure **Transcoding**:
     *   **Enable Transcoding**: Toggle on/off.
     *   **Max Bitrate**: Select your preferred quality (e.g., 320 kbps, 128 kbps).
     *   **Format**: Choose the transcoding format (default: mp3).
+6.  (Optional) Configure **Offline**:
+    *   **Enable Offline Cache** (default: on) adds the download context-menu
+        entries and the **Offline** item on the main menu.
+    *   **Offline Cache Size (MB)**: once the cache exceeds this, the least
+        recently downloaded tracks are dropped.
+    *   **Clear Offline Cache**: delete every downloaded track.
+7.  (Optional) Configure **Display**:
+    *   **Items Per Page**: how many rows each page of a long list holds. Pages
+        larger than 500 are assembled from several requests, because that is the
+        most the server will return at once.
 
 ## Known Issues & Roadmap
 
-*   **VFS Implementation**: The addon currently uses direct HTTP URLs for streaming. Full implementation of the Kodi Virtual File System (VFS) path is planned. This will improve compatibility and functionality with certain Kodi features that rely on local-like file access.
-    *   *Current Status*: Functional for streaming and playback.
+*   **VFS Implementation**: *Done.* Playback now resolves through the plugin
+    (`setResolvedUrl`) rather than handing Kodi a bare HTTP URL, and everything
+    the addon stores — the offline media cache, its metadata sidecars, the cached
+    login and the now-playing marker — goes through `xbmcvfs`, so it works on
+    platforms where the addon data directory is not a plain local path.
+*   **Show Track Numbers in Title**: the setting exists but is not wired up yet.
 
 ## Development
 
@@ -53,8 +84,11 @@ This addon is written in Python and uses the standard Kodi Addon API.
 
 ### Structure
 *   `default.py`: Main addon entry point and routing logic.
-*   `service.py`: Background service (likely handles scrobbling/status updates).
-*   `lib/navidrome_api.py`: Wrapper for the Navidrome/Subsonic API.
+*   `service.py`: Background service (scrobbling and "Now Playing" updates).
+*   `lib/navidrome_api.py`: Wrapper for the Navidrome native, Subsonic and
+    OpenSubsonic APIs, including TLS setup and page assembly.
+*   `lib/vfs.py`: Kodi Virtual File System layer — paths, JSON/binary IO and the
+    offline media cache.
 *   `resources/`: Settings, language files, and images.
 
 ## License
